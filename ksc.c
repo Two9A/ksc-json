@@ -5,13 +5,14 @@
 
 extern char *opt_file;
 
-static ksc_entry ksc_data[KSC_KEY_COUNT];
+static ksc_entry ksc_data[KSC_DATASETS][KSC_KEY_COUNT];
 
 int ksc_connect()
 {
     struct addrinfo hints, *hosts, *p;
     struct sockaddr_in *addr;
-    int status, i;
+    struct timeval timeout;
+    int status, i, j;
     char str[128];
 
     memset(&hints, 0, sizeof(hints));
@@ -27,20 +28,35 @@ int ksc_connect()
     but in the canonical case there's only one */
     for (p = hosts; p != NULL; p = p->ai_next) {
         if (p->ai_family == AF_INET) {
+            timeout.tv_sec = 5;
+            timeout.tv_usec = 0;
             addr = (struct sockaddr_in *)p->ai_addr;
-            addr->sin_port = htons(KSC_PORT);
 
-            ksc_sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (ksc_sock == -1) {
-                sprintf(str, "Error getting socket: %s", strerror(errno));
-                log_write(str, false);
-                return false;
-            }
+            for (i = 0; i < KSC_DATASETS; i++) {
+                switch (i) {
+                    case KSC_DATASET_KSC:
+                        addr->sin_port = htons(KSC_PORT_KSC);
+                        break;
 
-            if (connect(ksc_sock, (struct sockaddr *)addr, p->ai_addrlen) != 0) {
-                sprintf(str, "Error connecting: %s", strerror(errno));
-                log_write(str, false);
-                return false;
+                    case KSC_DATASET_VAFB:
+                        addr->sin_port = htons(KSC_PORT_VAFB);
+                        break;
+                }
+
+                ksc_sock[i] = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+                if (ksc_sock[i] == -1) {
+                    sprintf(str, "Error getting socket: %s", strerror(errno));
+                    log_write(str, false);
+                    return false;
+                }
+
+                if (connect(ksc_sock[i], (struct sockaddr *)addr, p->ai_addrlen) != 0) {
+                    sprintf(str, "Error connecting: %s", strerror(errno));
+                    log_write(str, false);
+                    return false;
+                }
+
+                setsockopt(ksc_sock[i], SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
             }
             break;
         }
@@ -92,13 +108,15 @@ int ksc_connect()
         {"EVENTTIM10", KSC_VAL_RAW, 11}
     };
 
-    for (i = 0; i < KSC_KEY_COUNT; i++) {
-        strncpy(ksc_data[i].key, entries[i].key, KSC_KEY_LEN);
-        ksc_data[i].key[KSC_KEY_LEN] = 0;
+    for (i = 0; i < KSC_DATASETS; i++) {
+        for (j = 0; j < KSC_KEY_COUNT; j++) {
+            strncpy(ksc_data[i][j].key, entries[j].key, KSC_KEY_LEN);
+            ksc_data[i][j].key[KSC_KEY_LEN] = 0;
 
-        ksc_data[i].key_crc = crc16(entries[i].key, KSC_KEY_LEN);
-        ksc_data[i].val_type = entries[i].val_type;
-        ksc_data[i].val_len = entries[i].val_len;
+            ksc_data[i][j].key_crc = crc16(entries[j].key, KSC_KEY_LEN);
+            ksc_data[i][j].val_type = entries[j].val_type;
+            ksc_data[i][j].val_len = entries[j].val_len;
+        }
     }
 
     return true;
@@ -107,41 +125,51 @@ int ksc_connect()
 int ksc_fetch()
 {
     char str[128];
-    int len;
+    int len, i, parsed = 0;
 
-    if (!ksc_sock) {
+    if (!(ksc_sock[KSC_DATASET_KSC] && ksc_sock[KSC_DATASET_VAFB])) {
         ksc_connect();
     }
 
-    if (!send(ksc_sock, "\000", 1, 0)) {
-        sprintf(str, "Error requesting data: %s", strerror(errno));
-        log_write(str, false);
-        return false;
-    }
-
-    if (!(len = recv(ksc_sock, ksc_recv_buf, 2048, 0))) {
-        sprintf(str, "Error receiving data: %s", strerror(errno));
-        log_write(str, false);
-        return false;
-    }
-
-    sprintf(str, "Received %d bytes", len);
-    log_write(str, true);
-
-    if (len >= 3) {
-        if (ksc_parse()) {
-            ksc_output();
+    for (i = 0; i < KSC_DATASETS; i++) {
+        if (!send(ksc_sock[i], "\000", 1, 0)) {
+            sprintf(str, "Line %d: Error requesting data: %s", i, strerror(errno));
+            log_write(str, false);
+            return false;
         }
+
+        if ((len = recv(ksc_sock[i], ksc_recvbuf[i], 2048, 0)) <= 0) {
+            if (errno == EAGAIN) {
+                log_write("Timeout receiving data", false);
+                return true;
+            }
+            sprintf(str, "Line %d: Error receiving data: %s", i, strerror(errno));
+            log_write(str, false);
+            return false;
+        }
+
+        sprintf(str, "Line %d: Received %d bytes", i, len);
+        log_write(str, true);
+
+        if (len >= 3) {
+            if (ksc_parse(i)) {
+                parsed++;
+            }
+        }
+    }
+
+    if (parsed == KSC_DATASETS) {
+        ksc_output();
     }
 
     return true;
 }
 
-int ksc_parse()
+int ksc_parse(int dataset)
 {
-    char pattern = ksc_recv_buf[0];
-    char version = ksc_recv_buf[1];
-    char changes = ksc_recv_buf[2];
+    char pattern = ksc_recvbuf[dataset][0];
+    char version = ksc_recvbuf[dataset][1];
+    char changes = ksc_recvbuf[dataset][2];
 
     int i, j, key_offs = 3, val_offs = key_offs + changes * KSC_KEY_LEN;
     unsigned short crc;
@@ -160,14 +188,14 @@ int ksc_parse()
     }
 
     for (i = 0; i < changes; i++, key_offs += KSC_KEY_LEN) {
-        crc = crc16(ksc_recv_buf + key_offs, KSC_KEY_LEN);
+        crc = crc16(ksc_recvbuf[dataset] + key_offs, KSC_KEY_LEN);
 
         for (j = 0; j < KSC_KEY_COUNT; j++) {
-            if (crc == ksc_data[j].key_crc) {
+            if (crc == ksc_data[dataset][j].key_crc) {
                 // TODO: Handle the different types of value data
                 // All data currently returned is RAW
-                ksc_data[j].val = ksc_recv_buf + val_offs;
-                val_offs += ksc_data[j].val_len;
+                ksc_data[dataset][j].val = ksc_recvbuf[dataset] + val_offs;
+                val_offs += ksc_data[dataset][j].val_len;
                 break;
             }
         }
@@ -178,15 +206,28 @@ int ksc_parse()
 
 int ksc_output()
 {
-    json_t *root = json_object();
-    json_t *raw = json_object();
-    int i;
+    json_t *root;
+    json_t *datasets[KSC_DATASETS], *raw[KSC_DATASETS];
+
+    int i, j;
     FILE *fp;
     
-    for (i = 0; i < KSC_KEY_COUNT; i++) {
-        json_object_set_new(raw, ksc_data[i].key, json_string(ksc_data[i].val));
+    for (i = 0; i < KSC_DATASETS; i++) {
+        datasets[i] = json_object();
+        raw[i] = json_object();
+
+        for (j = 0; j < KSC_KEY_COUNT; j++) {
+            json_object_set_new(raw[i], ksc_data[i][j].key, json_string(ksc_data[i][j].val));
+        }
+
+        json_object_set_new(datasets[i], "raw", raw[i]);
     }
-    json_object_set_new(root, "raw", raw);
+
+    root = json_pack(
+        "{soso}",
+        "ksc", datasets[KSC_DATASET_KSC],
+        "vafb", datasets[KSC_DATASET_VAFB]
+    );
 
     fp = fopen(opt_file, "w");
     if (!fp) {
@@ -197,7 +238,10 @@ int ksc_output()
     fprintf(fp, "%s", json_dumps(root, 0));
     fclose(fp);
 
-    json_decref(raw);
+    for (i = 0; i < KSC_DATASETS; i++) {
+        json_decref(raw[i]);
+        json_decref(datasets[i]);
+    }
     json_decref(root);
 
     return true;
